@@ -144,7 +144,7 @@ export async function saveOnWhatsappCache(data: ISaveOnWhatsappCacheParams[]) {
         const isDataSame =
           existingRecord.remoteJid === dataPayload.remoteJid &&
           existingJidOptionsString === dataPayload.jidOptions &&
-          existingRecord.lid === dataPayload.lid;
+          (existingRecord as any).lid === dataPayload.lid;
 
         if (isDataSame) {
           logger.verbose(`[saveOnWhatsappCache] Data for ${remoteJid} is already up-to-date. Skipping update.`);
@@ -203,7 +203,7 @@ export async function getOnWhatsappCache(remoteJids: string[]) {
       remoteJid: item.remoteJid,
       number: item.remoteJid.split('@')[0],
       jidOptions: item.jidOptions.split(','),
-      lid: item.lid,
+      lid: (item as any).lid,
     }));
   }
 

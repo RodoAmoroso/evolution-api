@@ -82,6 +82,7 @@ import { createId as cuid } from '@paralleldrive/cuid2';
 import { Instance, Message } from '@prisma/client';
 import { createJid } from '@utils/createJid';
 import { fetchLatestWaWebVersion } from '@utils/fetchLatestWaWebVersion';
+import { jsonPath } from '@utils/jsonPath';
 import { makeProxyAgent, makeProxyAgentUndici } from '@utils/makeProxyAgent';
 import { getOnWhatsappCache, saveOnWhatsappCache } from '@utils/onWhatsappCache';
 import { status } from '@utils/renderStatus';
@@ -522,17 +523,20 @@ export class BaileysStartupService extends ChannelStartupService {
 
   private async getMessage(key: proto.IMessageKey, full = false) {
     try {
-      // Use raw SQL to avoid JSON path issues
-      const webMessageInfo = (await this.prismaRepository.$queryRaw`
-        SELECT * FROM "Message"
-        WHERE "instanceId" = ${this.instanceId}
-        AND "key"->>'id' = ${key.id}
-      `) as proto.IWebMessageInfo[];
+      const webMessageInfo = (await this.prismaRepository.message.findMany({
+        where: {
+          instanceId: this.instanceId,
+          key: {
+            path: jsonPath('id'),
+            equals: key.id,
+          },
+        },
+      })) as unknown as proto.IWebMessageInfo[];
 
       if (full) {
         return webMessageInfo[0];
       }
-      if (webMessageInfo[0].message?.pollCreationMessage) {
+      if (webMessageInfo[0]?.message?.pollCreationMessage) {
         const messageSecretBase64 = webMessageInfo[0].message?.messageContextInfo?.messageSecret;
 
         if (typeof messageSecretBase64 === 'string') {
@@ -547,7 +551,7 @@ export class BaileysStartupService extends ChannelStartupService {
         }
       }
 
-      return webMessageInfo[0].message;
+      return webMessageInfo[0]?.message;
     } catch {
       return { conversation: '' };
     }
@@ -1627,7 +1631,6 @@ export class BaileysStartupService extends ChannelStartupService {
           let findMessage: any;
           const configDatabaseData = this.configService.get<Database>('DATABASE').SAVE_DATA;
           if (configDatabaseData.HISTORIC || configDatabaseData.NEW_MESSAGE) {
-            // Use raw SQL to avoid JSON path issues
             const protocolMapKey = `protocol_${key.id}`;
             const originalMessageId = (await this.baileysCache.get(protocolMapKey)) as string;
 
@@ -1637,13 +1640,15 @@ export class BaileysStartupService extends ChannelStartupService {
 
             const searchId = originalMessageId || key.id;
 
-            const messages = (await this.prismaRepository.$queryRaw`
-              SELECT * FROM "Message"
-              WHERE "instanceId" = ${this.instanceId}
-              AND "key"->>'id' = ${searchId}
-              LIMIT 1
-            `) as any[];
-            findMessage = messages[0] || null;
+            findMessage = await this.prismaRepository.message.findFirst({
+              where: {
+                instanceId: this.instanceId,
+                key: {
+                  path: jsonPath('id'),
+                  equals: searchId,
+                },
+              },
+            });
 
             if (!findMessage?.id) {
               this.logger.warn(`Original message not found for update. Skipping. Key: ${JSON.stringify(key)}`);
@@ -1819,7 +1824,7 @@ export class BaileysStartupService extends ChannelStartupService {
       const savedLabel = labelsRepository.find((l) => l.labelId === label.id);
       if (label.deleted && savedLabel) {
         await this.prismaRepository.label.delete({
-          where: { labelId_instanceId: { instanceId: this.instanceId, labelId: label.id } },
+          where: { id: savedLabel.id },
         });
         this.sendDataWebhook(Events.LABELS_EDIT, { ...label, instance: this.instance.name });
         return;
@@ -1835,11 +1840,16 @@ export class BaileysStartupService extends ChannelStartupService {
             predefinedId: label.predefinedId,
             instanceId: this.instanceId,
           };
-          await this.prismaRepository.label.upsert({
-            where: { labelId_instanceId: { instanceId: labelData.instanceId, labelId: labelData.labelId } },
-            update: labelData,
-            create: labelData,
-          });
+          if (savedLabel) {
+            await this.prismaRepository.label.update({
+              where: { id: savedLabel.id },
+              data: labelData,
+            });
+          } else {
+            await this.prismaRepository.label.create({
+              data: labelData,
+            });
+          }
         }
       }
     },
@@ -3776,7 +3786,7 @@ export class BaileysStartupService extends ChannelStartupService {
         if (messageId) {
           const isLogicalDeleted = configService.get<Database>('DATABASE').DELETE_DATA.LOGICAL_MESSAGE_DELETE;
           let message = await this.prismaRepository.message.findFirst({
-            where: { key: { path: ['id'], equals: messageId } },
+            where: { key: { path: jsonPath('id'), equals: messageId } },
           });
           if (isLogicalDeleted) {
             if (!message) return response;
@@ -4196,7 +4206,7 @@ export class BaileysStartupService extends ChannelStartupService {
           const messageId = messageSent.message?.protocolMessage?.key?.id;
           if (messageId && this.configService.get<Database>('DATABASE').SAVE_DATA.NEW_MESSAGE) {
             let message = await this.prismaRepository.message.findFirst({
-              where: { key: { path: ['id'], equals: messageId } },
+              where: { key: { path: jsonPath('id'), equals: messageId } },
             });
             if (!message) throw new NotFoundException('Message not found');
 
@@ -4734,23 +4744,25 @@ export class BaileysStartupService extends ChannelStartupService {
   private async updateMessagesReadedByTimestamp(remoteJid: string, timestamp?: number): Promise<number> {
     if (timestamp === undefined || timestamp === null) return 0;
 
-    // Use raw SQL to avoid JSON path issues
-    const result = await this.prismaRepository.$executeRaw`
-      UPDATE "Message"
-      SET "status" = ${status[4]}
-      WHERE "instanceId" = ${this.instanceId}
-      AND "key"->>'remoteJid' = ${remoteJid}
-      AND ("key"->>'fromMe')::boolean = false
-      AND "messageTimestamp" <= ${timestamp}
-      AND ("status" IS NULL OR "status" = ${status[3]})
-    `;
+    const result = await this.prismaRepository.message.updateMany({
+      where: {
+        instanceId: this.instanceId,
+        messageTimestamp: { lte: timestamp },
+        OR: [{ status: null }, { status: status[3] }],
+        AND: [
+          { key: { path: jsonPath('remoteJid'), equals: remoteJid } },
+          { key: { path: jsonPath('fromMe'), equals: false } },
+        ],
+      },
+      data: { status: status[4] },
+    });
 
     if (result) {
-      if (result > 0) {
+      if (result.count > 0) {
         this.updateChatUnreadMessages(remoteJid);
       }
 
-      return result;
+      return result.count;
     }
 
     return 0;
@@ -4758,15 +4770,17 @@ export class BaileysStartupService extends ChannelStartupService {
 
   private async updateChatUnreadMessages(remoteJid: string): Promise<number> {
     const [chat, unreadMessages] = await Promise.all([
-      this.prismaRepository.chat.findFirst({ where: { remoteJid } }),
-      // Use raw SQL to avoid JSON path issues
-      this.prismaRepository.$queryRaw`
-        SELECT COUNT(*)::int as count FROM "Message"
-        WHERE "instanceId" = ${this.instanceId}
-        AND "key"->>'remoteJid' = ${remoteJid}
-        AND ("key"->>'fromMe')::boolean = false
-        AND "status" = ${status[3]}
-      `.then((result: any[]) => result[0]?.count || 0),
+      this.prismaRepository.chat.findFirst({ where: { remoteJid, instanceId: this.instanceId } }),
+      this.prismaRepository.message.count({
+        where: {
+          instanceId: this.instanceId,
+          status: { equals: status[3] },
+          AND: [
+            { key: { path: jsonPath('remoteJid'), equals: remoteJid } },
+            { key: { path: jsonPath('fromMe'), equals: false } },
+          ],
+        },
+      }),
     ]);
 
     if (chat && chat.unreadMessages !== unreadMessages) {
@@ -4777,51 +4791,48 @@ export class BaileysStartupService extends ChannelStartupService {
   }
 
   private async addLabel(labelId: string, instanceId: string, chatId: string) {
-    const id = cuid();
+    const chat = await this.prismaRepository.chat.findFirst({
+      where: {
+        instanceId,
+        remoteJid: chatId,
+      },
+    });
 
-    await this.prismaRepository.$executeRawUnsafe(
-      `INSERT INTO "Chat" ("id", "instanceId", "remoteJid", "labels", "createdAt", "updatedAt")
-       VALUES ($4, $2, $3, to_jsonb(ARRAY[$1]::text[]), NOW(), NOW()) ON CONFLICT ("instanceId", "remoteJid")
-     DO
-      UPDATE
-          SET "labels" = (
-          SELECT to_jsonb(array_agg(DISTINCT elem))
-          FROM (
-          SELECT jsonb_array_elements_text("Chat"."labels") AS elem
-          UNION
-          SELECT $1::text AS elem
-          ) sub
-          ),
-          "updatedAt" = NOW();`,
-      labelId,
-      instanceId,
-      chatId,
-      id,
-    );
+    const currentLabels = Array.isArray(chat?.labels) ? (chat.labels as string[]) : [];
+    if (!currentLabels.includes(labelId)) {
+      const newLabels = [...currentLabels, labelId];
+      if (chat) {
+        await this.prismaRepository.chat.update({
+          where: { id: chat.id },
+          data: { labels: newLabels },
+        });
+      } else {
+        await this.prismaRepository.chat.create({
+          data: {
+            instanceId,
+            remoteJid: chatId,
+            labels: newLabels,
+          },
+        });
+      }
+    }
   }
 
   private async removeLabel(labelId: string, instanceId: string, chatId: string) {
-    const id = cuid();
+    const chat = await this.prismaRepository.chat.findFirst({
+      where: {
+        instanceId,
+        remoteJid: chatId,
+      },
+    });
 
-    await this.prismaRepository.$executeRawUnsafe(
-      `INSERT INTO "Chat" ("id", "instanceId", "remoteJid", "labels", "createdAt", "updatedAt")
-       VALUES ($4, $2, $3, '[]'::jsonb, NOW(), NOW()) ON CONFLICT ("instanceId", "remoteJid")
-     DO
-      UPDATE
-          SET "labels" = COALESCE (
-          (
-          SELECT jsonb_agg(elem)
-          FROM jsonb_array_elements_text("Chat"."labels") AS elem
-          WHERE elem <> $1
-          ),
-          '[]'::jsonb
-          ),
-          "updatedAt" = NOW();`,
-      labelId,
-      instanceId,
-      chatId,
-      id,
-    );
+    if (chat && Array.isArray(chat.labels)) {
+      const newLabels = (chat.labels as string[]).filter((l) => l !== labelId);
+      await this.prismaRepository.chat.update({
+        where: { id: chat.id },
+        data: { labels: newLabels },
+      });
+    }
   }
 
   public async baileysOnWhatsapp(jid: string) {
@@ -5034,13 +5045,15 @@ export class BaileysStartupService extends ChannelStartupService {
         messageType: query?.where?.messageType,
         ...timestampFilter,
         AND: [
-          keyFilters?.id ? { key: { path: ['id'], equals: keyFilters?.id } } : {},
-          keyFilters?.fromMe ? { key: { path: ['fromMe'], equals: keyFilters?.fromMe } } : {},
-          keyFilters?.participant ? { key: { path: ['participant'], equals: keyFilters?.participant } } : {},
+          keyFilters?.id ? { key: { path: jsonPath('id'), equals: keyFilters?.id } } : {},
+          keyFilters?.fromMe ? { key: { path: jsonPath('fromMe'), equals: keyFilters?.fromMe } } : {},
+          keyFilters?.participant ? { key: { path: jsonPath('participant'), equals: keyFilters?.participant } } : {},
           {
             OR: [
-              keyFilters?.remoteJid ? { key: { path: ['remoteJid'], equals: keyFilters?.remoteJid } } : {},
-              keyFilters?.remoteJidAlt ? { key: { path: ['remoteJidAlt'], equals: keyFilters?.remoteJidAlt } } : {},
+              keyFilters?.remoteJid ? { key: { path: jsonPath('remoteJid'), equals: keyFilters?.remoteJid } } : {},
+              keyFilters?.remoteJidAlt
+                ? { key: { path: jsonPath('remoteJidAlt'), equals: keyFilters?.remoteJidAlt } }
+                : {},
             ],
           },
         ],
@@ -5063,13 +5076,15 @@ export class BaileysStartupService extends ChannelStartupService {
         messageType: query?.where?.messageType,
         ...timestampFilter,
         AND: [
-          keyFilters?.id ? { key: { path: ['id'], equals: keyFilters?.id } } : {},
-          keyFilters?.fromMe ? { key: { path: ['fromMe'], equals: keyFilters?.fromMe } } : {},
-          keyFilters?.participant ? { key: { path: ['participant'], equals: keyFilters?.participant } } : {},
+          keyFilters?.id ? { key: { path: jsonPath('id'), equals: keyFilters?.id } } : {},
+          keyFilters?.fromMe ? { key: { path: jsonPath('fromMe'), equals: keyFilters?.fromMe } } : {},
+          keyFilters?.participant ? { key: { path: jsonPath('participant'), equals: keyFilters?.participant } } : {},
           {
             OR: [
-              keyFilters?.remoteJid ? { key: { path: ['remoteJid'], equals: keyFilters?.remoteJid } } : {},
-              keyFilters?.remoteJidAlt ? { key: { path: ['remoteJidAlt'], equals: keyFilters?.remoteJidAlt } } : {},
+              keyFilters?.remoteJid ? { key: { path: jsonPath('remoteJid'), equals: keyFilters?.remoteJid } } : {},
+              keyFilters?.remoteJidAlt
+                ? { key: { path: jsonPath('remoteJidAlt'), equals: keyFilters?.remoteJidAlt } }
+                : {},
             ],
           },
         ],
